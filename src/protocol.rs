@@ -2,13 +2,14 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::{i32, u64};
 
 use bytes::BytesMut;
 use futures::sync::mpsc;
 use futures::{self, Async, Poll, StartSend, Stream};
-use tokio::runtime::current_thread::Handle;
 use tokio_codec::{Decoder, Encoder, Framed};
+// use tokio_current_thread::{CurrentThread, Handle};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_proto::multiplex::{ClientProto, RequestId};
 
@@ -160,7 +161,7 @@ impl From<Tag> for LdapResultExt {
 }
 
 pub struct LdapCodec {
-    pub bundle: Rc<RefCell<ProtoBundle>>,
+    pub bundle: Arc<Mutex<ProtoBundle>>,
 }
 
 impl Decoder for LdapCodec {
@@ -222,7 +223,7 @@ impl Decoder for LdapCodec {
             IResult::Done(_, id) => id as i32,
             _ => return Err(decoding_error),
         };
-        let id = match self.bundle.borrow().id_map.get(&msgid) {
+        let id = match self.bundle.clone().into_inner().unwrap().id_map.get(&msgid) {
             Some(&id) => id,
             None => {
                 warn!("discarding frame with unmatched msgid: {}", msgid);
@@ -241,7 +242,7 @@ impl Decoder for LdapCodec {
                     inner: id as i64,
                     ..Default::default()
                 });
-                let mut bundle = self.bundle.borrow_mut();
+                let mut bundle = self.bundle.clone().get_mut().unwrap();
                 let helper = match bundle.search_helpers.get_mut(&id) {
                     Some(h) => h,
                     None => {
@@ -265,7 +266,7 @@ impl Decoder for LdapCodec {
                 }
             }
             _ => {
-                self.bundle.borrow_mut().id_map.remove(&msgid);
+                self.bundle.clone().get_mut().unwrap().id_map.remove(&msgid);
                 Ok(Some((id, (Tag::StructureTag(protoop), controls))))
             }
         }
@@ -282,7 +283,11 @@ impl Encoder for LdapCodec {
             LdapOp::Solo(tag, controls) => (tag, controls, true),
             LdapOp::Single(tag, controls) => (tag, controls, false),
             LdapOp::Multi(tag, tx, controls) => {
-                self.bundle.borrow_mut().create_search_helper(id, tx);
+                self.bundle
+                    .clone()
+                    .get_mut()
+                    .unwrap()
+                    .create_search_helper(id, tx);
                 (tag, controls, false)
             }
         };
@@ -290,7 +295,7 @@ impl Encoder for LdapCodec {
             // tokio-proto ids are u64, and LDAP (client) message ids are i32 > 0,
             // so we must have wraparound logic and a mapping from the latter to
             // the former
-            let mut bundle = self.bundle.borrow_mut();
+            let mut bundle = self.bundle.clone().get_mut().unwrap();
             let prev_ldap_id = bundle.next_id;
             let mut next_ldap_id = prev_ldap_id;
             while bundle.id_map.entry(next_ldap_id).or_insert(id) != &id {
@@ -336,13 +341,13 @@ impl Encoder for LdapCodec {
 
 #[derive(Clone)]
 pub struct LdapProto {
-    bundle: Rc<RefCell<ProtoBundle>>,
+    bundle: Arc<Mutex<ProtoBundle>>,
 }
 
 impl LdapProto {
     pub fn new() -> LdapProto {
         LdapProto {
-            bundle: Rc::new(RefCell::new(ProtoBundle {
+            bundle: Arc::new(Mutex::new(ProtoBundle {
                 search_helpers: HashMap::new(),
                 id_map: HashMap::new(),
                 next_id: 1,
@@ -351,14 +356,14 @@ impl LdapProto {
         }
     }
 
-    pub fn bundle(&self) -> Rc<RefCell<ProtoBundle>> {
+    pub fn bundle(&self) -> Arc<Mutex<ProtoBundle>> {
         self.bundle.clone()
     }
 }
 
 pub struct ResponseFilter<T> {
     pub upstream: T,
-    pub bundle: Rc<RefCell<ProtoBundle>>,
+    pub bundle: Arc<Mutex<ProtoBundle>>,
 }
 
 impl<T> Stream for ResponseFilter<T>
@@ -370,11 +375,13 @@ where
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         loop {
-            let maybe_msgid = self.bundle.borrow_mut().solo_ops.pop_front();
+            let maybe_msgid = self.bundle.clone().get_mut().unwrap().solo_ops.pop_front();
             if let Some(msgid) = maybe_msgid {
                 let id = self
                     .bundle
-                    .borrow_mut()
+                    .clone()
+                    .get_mut()
+                    .unwrap()
                     .id_map
                     .remove(&msgid)
                     .expect("id from id_map");

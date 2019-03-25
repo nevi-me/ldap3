@@ -19,7 +19,11 @@ native-tls = { version = "0.2", optional = true }
 nom = "2.0"
 tokio-codec = "0.1"
 tokio = {version = "0.1", features = ["tcp"]}
-tokio-proto = { git = "https://github.com/red75prime/tokio-proto" }
+tokio-current-thread = "0.1"
+# tokio-proto = { git = "https://github.com/red75prime/tokio-proto" }
+tokio-proto = { path = "../tokio-proto" }
+# tower = { git = "https://github.com/tower-rs/tower" }
+# tower-service = { git = "https://github.com/tower-rs/tower" }
 tokio-io = "0.1"
 tokio-tcp = "0.1"
 tokio-service = "0.1"

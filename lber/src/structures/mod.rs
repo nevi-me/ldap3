@@ -16,7 +16,7 @@ pub use self::null::Null;
 pub use self::explicit::ExplicitTag;
 
 /// Conversion of a tag into a serializable form.
-pub trait ASNTag {
+pub trait ASNTag: Send {
     /// Encode yourself into a generic Tag format.
     ///
     /// The only thing that changes between types is how to encode the wrapped value into bytes;
@@ -48,6 +48,9 @@ pub enum Tag {
     /// Serializable value.
     StructureTag(structure::StructureTag),
 }
+
+unsafe impl Send for Tag {}
+unsafe impl Sync for Tag {}
 
 impl ASNTag for Tag {
     fn into_structure(self) -> structure::StructureTag {

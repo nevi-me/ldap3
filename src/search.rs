@@ -1,9 +1,10 @@
-use std::cell::RefCell;
+// use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::AsRef;
 use std::io;
-use std::rc::Rc;
+// use std::rc::Rc;
 use std::str;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::u64;
 
@@ -87,7 +88,7 @@ pub struct SearchStream {
     id: RequestId,
     initial_timeout: bool,
     ldap: Ldap,
-    bundle: Rc<RefCell<ProtoBundle>>,
+    bundle: Arc<Mutex<ProtoBundle>>,
     tx_i: mpsc::UnboundedSender<SearchItem>,
     rx_i: mpsc::UnboundedReceiver<SearchItem>,
     tx_r: Option<oneshot::Sender<LdapResult>>,
@@ -131,7 +132,7 @@ impl SearchStream {
     }
 
     fn update_maps(&mut self, cause: EndCause) {
-        let mut bundle = self.bundle.borrow_mut();
+        let mut bundle = self.bundle.clone().into_inner().unwrap();
         if let Some(helper) = bundle.search_helpers.remove(&self.id) {
             if cause == EndCause::InitialTimeout {
                 bundle.solo_ops.push_back(helper.msgid);
@@ -206,7 +207,14 @@ impl Stream for SearchStream {
                 self.abandon_state = AbandonState::AwaitingOp;
                 self.rx_a = Some(rx_a);
                 let ldap = self.ldap.clone();
-                let msgid = match self.bundle.borrow().search_helpers.get(&self.id) {
+                let msgid = match self
+                    .bundle
+                    .clone()
+                    .into_inner()
+                    .unwrap()
+                    .search_helpers
+                    .get(&self.id)
+                {
                     Some(helper) => helper.msgid,
                     None => {
                         return Err(io::Error::new(
@@ -220,7 +228,7 @@ impl Stream for SearchStream {
                 } else {
                     ldap.abandon(msgid)
                 };
-                tokio::runtime::current_thread::spawn(
+                tokio_current_thread::spawn(
                     abandon.then(move |_r| tx_a.unbounded_send(()).map_err(|_e| ())),
                 );
                 continue;
@@ -306,7 +314,7 @@ impl Stream for SearchStream {
                                         cloned_tx.unbounded_send(resp).map_err(|_e| ())
                                     });
                                 // let handle = self.bundle.borrow().runtime.;
-                                tokio::runtime::current_thread::spawn(next_search);
+                                tokio_current_thread::spawn(next_search);
                                 continue 'poll_loop;
                             }
                         }
@@ -473,6 +481,9 @@ pub struct SearchOptions {
     autopage: Option<i32>,
 }
 
+unsafe impl Send for SearchOptions {}
+unsafe impl Sync for SearchOptions {}
+
 impl SearchOptions {
     /// Create an instance of the structure with default values.
     // Constructing SearchOptions through Default::default() seems very unlikely
@@ -541,7 +552,7 @@ impl Ldap {
         scope: Scope,
         filter: &str,
         attrs: Vec<S>,
-    ) -> Box<Future<Item = SearchResult, Error = io::Error>> {
+    ) -> Box<Future<Item = SearchResult, Error = io::Error> + Send> {
         let srch = self
             .streaming_search(base, scope, filter, attrs)
             .and_then(|mut strm| {
@@ -570,11 +581,12 @@ impl Ldap {
         scope: Scope,
         filter: &str,
         attrs: Vec<S>,
-    ) -> Box<Future<Item = SearchStream, Error = io::Error>> {
-        let opts = match next_search_options(self) {
-            Some(opts) => opts,
-            None => SearchOptions::new(),
-        };
+    ) -> Box<Future<Item = SearchStream, Error = io::Error> + Send> {
+        // let opts = match next_search_options(self) {
+        //     Some(opts) => opts,
+        //     None => SearchOptions::new(),
+        // };
+        let opts = SearchOptions::new();
         let req = Tag::Sequence(Sequence {
             id: 3,
             class: Application,
@@ -603,15 +615,16 @@ impl Ldap {
                     inner: opts.typesonly,
                     ..Default::default()
                 }),
-                match parse(filter) {
-                    Ok(filter) => filter,
-                    _ => {
-                        return Box::new(future::err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "filter parse error",
-                        )))
-                    }
-                },
+                parse(filter).unwrap(),
+                // match parse(filter) {
+                //     Ok(filter) => filter,
+                //     _ => {
+                //         return Box::new(future::err(io::Error::new(
+                //             io::ErrorKind::Other,
+                //             "filter parse error",
+                //         )))
+                //     }
+                // },
                 Tag::Sequence(Sequence {
                     inner: attrs
                         .into_iter()
@@ -637,17 +650,17 @@ impl Ldap {
         let ldap = self.clone();
         let (saved_op, saved_controls) = if let Some(pagesize) = opts.autopage {
             let mut controls = if let Some(controls) = next_req_controls(self) {
-                if controls
-                    .iter()
-                    .filter(|&control| &control.ctype == "1.2.840.113556.1.4.319")
-                    .count()
-                    > 0
-                {
-                    return Box::new(future::err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "PagedResults control present together with autopage",
-                    )));
-                }
+                // if controls
+                //     .iter()
+                //     .filter(|&control| &control.ctype == "1.2.840.113556.1.4.319")
+                //     .count()
+                //     > 0
+                // {
+                //     return Box::new(future::err(io::Error::new(
+                //         io::ErrorKind::Other,
+                //         "PagedResults control present together with autopage",
+                //     )));
+                // }
                 controls
             } else {
                 vec![]

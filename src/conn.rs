@@ -1,21 +1,19 @@
 #[cfg(all(unix, not(feature = "minimal")))]
 use std::borrow::Borrow;
-use std::cell::RefCell;
+// use std::cell::RefCell;
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::hash::Hash;
 use std::io;
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
-use std::rc::Rc;
+// use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future;
 use futures::sync::oneshot;
 use futures::{Async, Future, Poll, Stream};
-// use tokio::executor::DefaultExecutor;
-use tokio::runtime::current_thread::Handle;
-use tokio::runtime::current_thread::Runtime;
 #[cfg(all(unix, not(feature = "minimal")))]
 use url::percent_encoding::percent_decode;
 use url::{Host, Url};
@@ -39,12 +37,10 @@ impl LdapWrapper {
 
     fn connect(
         addr: Box<Future<Item = SocketAddr, Error = io::Error>>,
-        handle: &Handle,
         settings: LdapConnSettings,
     ) -> Box<Future<Item = LdapWrapper, Error = io::Error>> {
-        let handle = handle.clone();
         let lw = addr
-            .and_then(move |addr| Ldap::connect(&addr, &handle, settings))
+            .and_then(move |addr| Ldap::connect(&addr, settings))
             .map(|ldap| LdapWrapper { inner: ldap });
         Box::new(lw)
     }
@@ -53,13 +49,11 @@ impl LdapWrapper {
     fn connect_ssl(
         addr: Box<Future<Item = SocketAddr, Error = io::Error>>,
         hostname: &str,
-        handle: &Handle,
         settings: LdapConnSettings,
     ) -> Box<Future<Item = LdapWrapper, Error = io::Error>> {
-        let handle = handle.clone();
         let hostname = hostname.to_owned();
         let lw = addr
-            .and_then(move |addr| Ldap::connect_ssl(&addr, &hostname, &handle, settings))
+            .and_then(move |addr| Ldap::connect_ssl(&addr, &hostname, settings))
             .map(|ldap| LdapWrapper { inner: ldap });
         Box::new(lw)
     }
@@ -67,7 +61,6 @@ impl LdapWrapper {
     #[cfg(all(unix, not(feature = "minimal")))]
     fn connect_unix(
         path: &str,
-        handle: &Handle,
         settings: LdapConnSettings,
     ) -> Box<Future<Item = LdapWrapper, Error = io::Error>> {
         let lw = Ldap::connect_unix(path, handle, settings).map(|ldap| LdapWrapper { inner: ldap });
@@ -92,7 +85,6 @@ impl LdapWrapper {
 /// After regular termination or cancellation, the overall result of the search
 /// _must_ be retrieved by calling [`result()`](#method.result) on the stream handle.
 pub struct EntryStream {
-    runtime: Rc<RefCell<Runtime>>,
     strm: Option<SearchStream>,
     rx_r: Option<oneshot::Receiver<LdapResult>>,
 }
@@ -113,10 +105,10 @@ impl EntryStream {
                 "cannot fetch from an invalid stream",
             ));
         }
-        let (tag, strm) = self
-            .runtime
-            .borrow_mut()
-            .block_on(strm.expect("stream").into_future())
+        let (tag, strm) = strm
+            .expect("stream")
+            .into_future()
+            .wait()
             .map_err(|e| e.0)?;
         self.strm = Some(strm);
         Ok(tag)
@@ -134,10 +126,8 @@ impl EntryStream {
             ));
         }
         let rx_r = self.rx_r.take().expect("oneshot rx");
-        let res = self
-            .runtime
-            .borrow_mut()
-            .block_on(rx_r)
+        let res = rx_r
+            .wait()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(res)
     }
@@ -208,7 +198,6 @@ impl EntryStream {
 /// user-supplied code.
 #[derive(Clone)]
 pub struct LdapConn {
-    runtime: Rc<RefCell<Runtime>>, // why do we need a refcell here? I'm trying to remove it to see what happens
     inner: Ldap,
 }
 
@@ -223,21 +212,14 @@ impl LdapConn {
     /// Open a connection to an LDAP server specified by `url`, using
     /// `settings` to specify additional parameters.
     pub fn with_settings(settings: LdapConnSettings, url: &str) -> io::Result<Self> {
-        let mut runtime = Runtime::new()?;
-        let conn = LdapConnAsync::with_settings(settings, url, &runtime.handle())?;
-        let ldap = runtime.block_on(conn)?;
-        Ok(LdapConn {
-            runtime: Rc::new(RefCell::new(runtime)),
-            inner: ldap,
-        })
+        let conn = LdapConnAsync::with_settings(settings, url)?;
+        let ldap = conn.wait()?;
+        Ok(LdapConn { inner: ldap })
     }
 
     /// Do a simple Bind with the provided DN (`bind_dn`) and password (`bind_pw`).
     pub fn simple_bind(&self, bind_dn: &str, bind_pw: &str) -> io::Result<LdapResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().simple_bind(bind_dn, bind_pw))?)
+        Ok(self.inner.clone().simple_bind(bind_dn, bind_pw).wait()?)
     }
 
     #[cfg(not(feature = "minimal"))]
@@ -246,10 +228,7 @@ impl LdapConn {
     /// is the case for Unix domain sockets or TLS client certificates. The bind
     /// is made with the hardcoded empty authzId value.
     pub fn sasl_external_bind(&self) -> io::Result<LdapResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().sasl_external_bind())?)
+        Ok(self.inner.clone().sasl_external_bind().wait()?)
     }
 
     /// Use the provided `SearchOptions` with the next Search operation, which can
@@ -318,7 +297,7 @@ impl LdapConn {
         attrs: Vec<S>,
     ) -> io::Result<SearchResult> {
         let srch = self.inner.clone().search(base, scope, filter, attrs);
-        Ok(self.runtime.borrow_mut().block_on(srch)?)
+        Ok(srch.wait().unwrap())
     }
 
     /// Perform a Search, but unlike [`search()`](#method.search) (q.v., also for
@@ -332,14 +311,13 @@ impl LdapConn {
         filter: &str,
         attrs: Vec<S>,
     ) -> io::Result<EntryStream> {
-        let mut strm = self.runtime.borrow_mut().block_on(
-            self.inner
-                .clone()
-                .streaming_search(base, scope, filter, attrs),
-        )?;
+        let mut strm = self
+            .inner
+            .clone()
+            .streaming_search(base, scope, filter, attrs)
+            .wait()?;
         let rx_r = strm.get_result_rx()?;
         Ok(EntryStream {
-            runtime: self.runtime.clone(),
             strm: Some(strm),
             rx_r: Some(rx_r),
         })
@@ -353,18 +331,12 @@ impl LdapConn {
         dn: &str,
         attrs: Vec<(S, HashSet<S>)>,
     ) -> io::Result<LdapResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().add(dn, attrs))?)
+        Ok(self.inner.clone().add(dn, attrs).wait()?)
     }
 
     /// Delete an entry named by `dn`.
     pub fn delete(&self, dn: &str) -> io::Result<LdapResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().delete(dn))?)
+        Ok(self.inner.clone().delete(dn).wait()?)
     }
 
     /// Modify an entry named by `dn` by sequentially applying the modifications given by `mods`.
@@ -374,10 +346,7 @@ impl LdapConn {
         dn: &str,
         mods: Vec<Mod<S>>,
     ) -> io::Result<LdapResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().modify(dn, mods))?)
+        Ok(self.inner.clone().modify(dn, mods).wait()?)
     }
 
     /// Rename and/or move an entry named by `dn`. The new name is given by `rdn`. If
@@ -392,17 +361,15 @@ impl LdapConn {
         new_sup: Option<&str>,
     ) -> io::Result<LdapResult> {
         Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().modifydn(dn, rdn, delete_old, new_sup))?)
+            .inner
+            .clone()
+            .modifydn(dn, rdn, delete_old, new_sup)
+            .wait()?)
     }
 
     /// Terminate the connection to the server.
     pub fn unbind(&self) -> io::Result<()> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().unbind())?)
+        Ok(self.inner.clone().unbind().wait()?)
     }
 
     /// Compare the value(s) of the attribute `attr` within an entry named by `dn` with the
@@ -416,10 +383,7 @@ impl LdapConn {
         attr: &str,
         val: B,
     ) -> io::Result<CompareResult> {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().compare(dn, attr, val))?)
+        Ok(self.inner.clone().compare(dn, attr, val).wait()?)
     }
 
     /// Perform an Extended operation given by `exop`. Extended operations are defined in the
@@ -429,10 +393,7 @@ impl LdapConn {
     where
         E: Into<Exop>,
     {
-        Ok(self
-            .runtime
-            .borrow_mut()
-            .block_on(self.inner.clone().extended(exop))?)
+        Ok(self.inner.clone().extended(exop).wait()?)
     }
 }
 
@@ -473,8 +434,8 @@ impl LdapConn {
 /// ```
 #[derive(Clone)]
 pub struct LdapConnAsync {
-    in_progress: Rc<RefCell<Box<Future<Item = LdapWrapper, Error = io::Error>>>>,
-    wrapper: Rc<RefCell<Option<LdapWrapper>>>,
+    in_progress: Arc<Mutex<Box<Future<Item = LdapWrapper, Error = io::Error>>>>,
+    wrapper: Arc<Mutex<Option<LdapWrapper>>>,
 }
 
 impl LdapConnAsync {
@@ -485,19 +446,15 @@ impl LdapConnAsync {
     /// The __ldaps__ scheme will be available if the library is compiled with the __tls__
     /// feature, which is activated by default. Compiling without __tls__ or with the
     /// __minimal__ feature will omit TLS support.
-    pub fn new(url: &str, handle: &Handle) -> io::Result<Self> {
-        LdapConnAsync::new_tcp(url, handle, LdapConnSettings::new())
+    pub fn new(url: &str) -> io::Result<Self> {
+        LdapConnAsync::new_tcp(url, LdapConnSettings::new())
     }
 
     #[cfg(any(not(unix), feature = "minimal"))]
     /// Open a connection to an LDAP server specified by `url`, using
     /// `settings` to specify additional parameters.
-    pub fn with_settings(
-        settings: LdapConnSettings,
-        url: &str,
-        handle: &Handle,
-    ) -> io::Result<Self> {
-        LdapConnAsync::new_tcp(url, handle, settings)
+    pub fn with_settings(settings: LdapConnSettings, url: &str) -> io::Result<Self> {
+        LdapConnAsync::new_tcp(url, settings)
     }
 
     #[cfg(all(unix, not(feature = "minimal")))]
@@ -509,31 +466,27 @@ impl LdapConnAsync {
     /// The __ldaps__ scheme will be available if the library is compiled with the __tls__
     /// feature, which is activated by default. Compiling without __tls__ or with the
     /// __minimal__ feature will omit TLS support.
-    pub fn new(url: &str, handle: &Handle) -> io::Result<Self> {
+    pub fn new(url: &str) -> io::Result<Self> {
         if !url.starts_with("ldapi://") {
-            LdapConnAsync::new_tcp(url, handle, LdapConnSettings::new())
+            LdapConnAsync::new_tcp(url, LdapConnSettings::new())
         } else {
-            LdapConnAsync::new_unix(url, handle, LdapConnSettings::new())
+            LdapConnAsync::new_unix(url, LdapConnSettings::new())
         }
     }
 
     #[cfg(all(unix, not(feature = "minimal")))]
     /// Open a connection to an LDAP server specified by `url`, using
     /// `settings` to specify additional parameters.
-    pub fn with_settings(
-        settings: LdapConnSettings,
-        url: &str,
-        handle: &Handle,
-    ) -> io::Result<Self> {
+    pub fn with_settings(settings: LdapConnSettings, url: &str) -> io::Result<Self> {
         if !url.starts_with("ldapi://") {
-            LdapConnAsync::new_tcp(url, handle, settings)
+            LdapConnAsync::new_tcp(url, settings)
         } else {
-            LdapConnAsync::new_unix(url, handle, settings)
+            LdapConnAsync::new_unix(url, settings)
         }
     }
 
     #[cfg(all(unix, not(feature = "minimal")))]
-    fn new_unix(url: &str, handle: &Handle, settings: LdapConnSettings) -> io::Result<Self> {
+    fn new_unix(url: &str, settings: LdapConnSettings) -> io::Result<Self> {
         let path = url.split('/').nth(2).unwrap();
         if path.is_empty() {
             return Err(io::Error::new(
@@ -551,7 +504,6 @@ impl LdapConnAsync {
         Ok(LdapConnAsync {
             in_progress: Rc::new(RefCell::new(LdapWrapper::connect_unix(
                 dec_path.borrow(),
-                handle,
                 settings,
             ))),
             wrapper: Rc::new(RefCell::new(None)),
@@ -561,7 +513,7 @@ impl LdapConnAsync {
     // if the "tls" feature is off, settings doesn't have to be mut, and rustc
     // complains. Duplicating the function because of this would be overkill
     #[allow(unused_mut)]
-    fn new_tcp(url: &str, handle: &Handle, mut settings: LdapConnSettings) -> io::Result<Self> {
+    fn new_tcp(url: &str, mut settings: LdapConnSettings) -> io::Result<Self> {
         let url = Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let mut port = 389;
         let scheme = match url.scheme() {
@@ -601,14 +553,14 @@ impl LdapConnAsync {
         };
         Ok(LdapConnAsync {
             in_progress: match scheme {
-                "ldap" => Rc::new(RefCell::new(LdapWrapper::connect(addr, handle, settings))),
+                "ldap" => Arc::new(Mutex::new(LdapWrapper::connect(addr, settings))),
                 #[cfg(feature = "tls")]
-                "ldaps" => Rc::new(RefCell::new(LdapWrapper::connect_ssl(
-                    addr, _hostname, handle, settings,
+                "ldaps" => Arc::new(Mutex::new(LdapWrapper::connect_ssl(
+                    addr, _hostname, settings,
                 ))),
                 _ => unimplemented!(),
             },
-            wrapper: Rc::new(RefCell::new(None)),
+            wrapper: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -618,13 +570,13 @@ impl Future for LdapConnAsync {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Some(ref wrapper) = *RefCell::borrow(&self.wrapper) {
+        if let Some(ref wrapper) = &self.wrapper.clone().into_inner().unwrap() {
             return Ok(Async::Ready(wrapper.ldap()));
         }
-        match self.in_progress.borrow_mut().poll() {
+        match self.in_progress.clone().get_mut().unwrap().poll() {
             Ok(Async::Ready(wrapper)) => {
                 let ldap = wrapper.ldap();
-                mem::replace(&mut *self.wrapper.borrow_mut(), Some(wrapper));
+                mem::replace(&mut *self.wrapper.clone().get_mut().unwrap(), Some(wrapper));
                 Ok(Async::Ready(ldap))
             }
             Ok(Async::NotReady) => Ok(Async::NotReady),
@@ -632,3 +584,392 @@ impl Future for LdapConnAsync {
         }
     }
 }
+
+// #[derive(Clone)]
+// pub struct LdapConnAsync2 {
+//     inner: LdapConn2,
+// }
+
+// impl LdapConnAsync2 {
+//     // pub fn connection(&self) -> &LdapConn2 {
+//     //     &self.inner
+//     // }
+
+//     #[cfg(any(not(unix), feature = "minimal"))]
+//     /// Open a connection to an LDAP server specified by `url`. This is an LDAP URL, from
+//     /// which the scheme (__ldap__ or __ldaps__), host, and port are used.
+//     ///
+//     /// The __ldaps__ scheme will be available if the library is compiled with the __tls__
+//     /// feature, which is activated by default. Compiling without __tls__ or with the
+//     /// __minimal__ feature will omit TLS support.
+//     pub fn new(url: &str // handle: &Handle
+//     ) -> Box<Future<Item = Self, Error = io::Error>> {
+//         Self::new_tcp(url, LdapConnSettings::new())
+//     }
+
+//     // #[cfg(any(not(unix), feature = "minimal"))]
+//     // /// Open a connection to an LDAP server specified by `url`, using
+//     // /// `settings` to specify additional parameters.
+//     // pub fn with_settings(
+//     //     settings: LdapConnSettings,
+//     //     url: &str,
+//     // ) -> io::Result<Self> {
+//     //     Self::new_tcp(
+//     //         url, // handle,
+//     //         settings,
+//     //     )
+//     // }
+
+//     #[cfg(all(unix, not(feature = "minimal")))]
+//     /// Open a connection to an LDAP server specified by `url`. This is an LDAP URL, from
+//     /// which the scheme (__ldap__, __ldaps__, or __ldapi__), host, and port are used. If
+//     /// the scheme is __ldapi__, only the host portion of the url is allowed, and it must
+//     /// be a percent-encoded path of a Unix domain socket.
+//     ///
+//     /// The __ldaps__ scheme will be available if the library is compiled with the __tls__
+//     /// feature, which is activated by default. Compiling without __tls__ or with the
+//     /// __minimal__ feature will omit TLS support.
+//     pub fn new(url: &str, handle: &Handle) -> io::Result<Self> {
+//         if !url.starts_with("ldapi://") {
+//             LdapConnAsync::new_tcp(url, handle, LdapConnSettings::new())
+//         } else {
+//             LdapConnAsync::new_unix(url, handle, LdapConnSettings::new())
+//         }
+//     }
+
+//     // #[cfg(all(unix, not(feature = "minimal")))]
+//     // /// Open a connection to an LDAP server specified by `url`, using
+//     // /// `settings` to specify additional parameters.
+//     // pub fn with_settings(
+//     //     settings: LdapConnSettings,
+//     //     url: &str,
+//     //     handle: &Handle,
+//     // ) -> io::Result<Self> {
+//     //     if !url.starts_with("ldapi://") {
+//     //         LdapConnAsync::new_tcp(url, handle, settings)
+//     //     } else {
+//     //         LdapConnAsync::new_unix(url, handle, settings)
+//     //     }
+//     // }
+
+//     #[cfg(all(unix, not(feature = "minimal")))]
+//     fn new_unix(url: &str, handle: &Handle, settings: LdapConnSettings) -> io::Result<Self> {
+//         let path = url.split('/').nth(2).unwrap();
+//         if path.is_empty() {
+//             return Err(io::Error::new(
+//                 io::ErrorKind::Other,
+//                 "empty Unix domain socket path",
+//             ));
+//         }
+//         if path.contains(':') {
+//             return Err(io::Error::new(
+//                 io::ErrorKind::Other,
+//                 "the port must be empty in the ldapi scheme",
+//             ));
+//         }
+//         let dec_path = percent_decode(path.as_bytes()).decode_utf8_lossy();
+//         Ok(LdapConnAsync {
+//             in_progress: Rc::new(RefCell::new(LdapWrapper::connect_unix(
+//                 dec_path.borrow(),
+//                 handle,
+//                 settings,
+//             ))),
+//             wrapper: Rc::new(RefCell::new(None)),
+//         })
+//     }
+
+//     // if the "tls" feature is off, settings doesn't have to be mut, and rustc
+//     // complains. Duplicating the function because of this would be overkill
+//     #[allow(unused_mut)]
+//     fn new_tcp(
+//         url: &str,
+//         // handle: &Handle,
+//         mut settings: LdapConnSettings,
+//     ) -> Box<Future<Item = Self, Error = io::Error>> {
+//         let url = Url::parse(url)
+//             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+//             .unwrap();
+//         let mut port = 389;
+//         let scheme = match url.scheme() {
+//             s @ "ldap" => {
+//                 if is_starttls(&settings) {
+//                     "ldaps"
+//                 } else {
+//                     s
+//                 }
+//             }
+//             #[cfg(feature = "tls")]
+//             s @ "ldaps" => {
+//                 settings = settings.set_starttls(false);
+//                 port = 636;
+//                 s
+//             }
+//             s => {
+//                 panic!()
+//                 // return Err(io::Error::new(
+//                 //     io::ErrorKind::Other,
+//                 //     format!("unimplemented LDAP URL scheme: {}", s),
+//                 // ))
+//             }
+//         };
+//         if let Some(url_port) = url.port() {
+//             port = url_port;
+//         }
+//         let (_hostname, host_port) = match url.host_str() {
+//             Some(h) if h != "" => (h, format!("{}:{}", h, port)),
+//             Some(h) if h == "" => ("localhost", format!("localhost:{}", port)),
+//             _ => panic!("unexpected None from url.host_str()"),
+//         };
+//         let addr: Box<Future<Item = SocketAddr, Error = io::Error>> = match url.host() {
+//             Some(Host::Ipv4(v4)) => Box::new(future::ok(SocketAddr::new(IpAddr::V4(v4), port))),
+//             Some(Host::Ipv6(v6)) => Box::new(future::ok(SocketAddr::new(IpAddr::V6(v6), port))),
+//             Some(Host::Domain(_)) => resolve_addr(&host_port, &settings),
+//             _ => panic!("unexpected None from url.host()"),
+//         };
+//         let ldap_conn = match scheme {
+//             "ldap" => LdapWrapper::connect(addr, settings),
+//             #[cfg(feature = "tls")]
+//             "ldaps" => LdapWrapper::connect_ssl(
+//                 addr, _hostname, // handle,
+//                 settings,
+//             ),
+//             _ => unimplemented!(),
+//         };
+//         Box::new(ldap_conn.map(|wrapper| Self {
+//             inner: LdapConn2 {
+//                 inner: wrapper.inner,
+//             },
+//         }))
+//     }
+
+//     pub fn search<S: AsRef<str>>(
+//         &self,
+//         base: &str,
+//         scope: Scope,
+//         filter: &str,
+//         attrs: Vec<S>,
+//     ) -> Box<Future<Item = SearchResult, Error = io::Error>> {
+//         let srch = self.inner.clone().search(base, scope, filter, attrs);
+//         Box::new(futures::future::result(srch))
+//     }
+// }
+
+// #[derive(Clone)]
+// pub struct LdapConn2 {
+//     inner: Ldap,
+// }
+
+// impl LdapConn2 {
+//     /// Open a connection to an LDAP server specified by `url`. For the
+//     /// details of supported URL formats, see
+//     /// [`LdapConnAsync::new()`](struct.LdapConnAsync.html#method.new).
+//     pub fn new(url: &str) -> io::Result<Self> {
+//         Self::with_settings(LdapConnSettings::new(), url)
+//     }
+
+//     /// Open a connection to an LDAP server specified by `url`, using
+//     /// `settings` to specify additional parameters.
+//     pub fn with_settings(settings: LdapConnSettings, url: &str) -> io::Result<Self> {
+//         // let mut runtime = Runtime::new()?;
+//         let conn = LdapConnAsync::with_settings(settings, url)?;
+//         let ldap = tokio_current_thread::block_on_all(conn)?;
+//         Ok(Self {
+//             // runtime: Rc::new(RefCell::new(runtime)),
+//             inner: ldap,
+//         })
+//     }
+
+//     /// Do a simple Bind with the provided DN (`bind_dn`) and password (`bind_pw`).
+//     pub fn simple_bind(&self, bind_dn: &str, bind_pw: &str) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().simple_bind(bind_dn, bind_pw),
+//         )?)
+//     }
+
+//     #[cfg(not(feature = "minimal"))]
+//     /// Do a SASL EXTERNAL bind on the connection. The identity of the client
+//     /// must have already been established by connection-specific methods, as
+//     /// is the case for Unix domain sockets or TLS client certificates. The bind
+//     /// is made with the hardcoded empty authzId value.
+//     pub fn sasl_external_bind(&self) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().sasl_external_bind(),
+//         )?)
+//     }
+
+//     /// Use the provided `SearchOptions` with the next Search operation, which can
+//     /// be invoked directly on the result of this method. If this method is used in
+//     /// combination with a non-Search operation, the provided options will be silently
+//     /// discarded when the operation is invoked.
+//     ///
+//     /// The Search operation can be invoked on the result of this method.
+//     pub fn with_search_options(&self, opts: SearchOptions) -> &Self {
+//         self.inner.with_search_options(opts);
+//         self
+//     }
+
+//     /// Pass the provided request control(s) to the next LDAP operation.
+//     /// Controls can be constructed by instantiating structs in the
+//     /// [`controls`](controls/index.html) module, and converted to the form needed
+//     /// by this method by calling `into()` on the instances. Alternatively, a control
+//     /// struct may offer a constructor which will produce a `RawControl` instance
+//     /// itself. See the module-level documentation for the list of directly supported
+//     /// controls and procedures for defining custom controls.
+//     ///
+//     /// This method accepts either a single `RawControl` or a `Vec` of them, in
+//     /// order to make the call site less noisy, since it's expected that passing
+//     /// a single control will comprise the majority of uses.
+//     ///
+//     /// The desired operation can be invoked on the result of this method.
+//     pub fn with_controls<V: IntoRawControlVec>(&self, ctrls: V) -> &Self {
+//         self.inner.with_controls(ctrls);
+//         self
+//     }
+
+//     /// Perform the next operation with the timeout specified in `duration`.
+//     /// See the [`tokio-core`](https://docs.rs/tokio-core/) documentation
+//     /// for the `Timeout` struct for timer limitations. The LDAP Search
+//     /// operation consists of an indeterminate number of Entry/Referral
+//     /// replies; the timer is reset for each reply.
+//     ///
+//     /// If the timeout occurs, the operation will return an `io::Error`
+//     /// wrapping the string "timeout". The connection remains usable for
+//     /// subsequent operations.
+//     ///
+//     /// The desired operation can be invoked on the result of this method.
+//     pub fn with_timeout(&self, duration: Duration) -> &Self {
+//         self.inner.with_timeout(duration);
+//         self
+//     }
+
+//     /// Perform a Search with the given base DN (`base`), scope, filter, and
+//     /// the list of attributes to be returned (`attrs`). If `attrs` is empty,
+//     /// or if it contains a special name `*` (asterisk), return all (user) attributes.
+//     /// Requesting a special name `+` (plus sign) will return all operational
+//     /// attributes. Include both `*` and `+` in order to return all attributes
+//     /// of an entry.
+//     ///
+//     /// The returned structure wraps the vector of result entries and the overall
+//     /// result of the operation. Entries are not directly usable, and must be parsed by
+//     /// [`SearchEntry::construct()`](struct.SearchEntry.html#method.construct).
+//     ///
+//     /// This method should be used if it's known that the result set won't be
+//     /// large. For other situations, one can use [`streaming_search()`](#method.streaming_search).
+//     pub fn search<S: AsRef<str>>(
+//         &self,
+//         base: &str,
+//         scope: Scope,
+//         filter: &str,
+//         attrs: Vec<S>,
+//     ) -> io::Result<SearchResult> {
+//         let srch = self.inner.clone().search(base, scope, filter, attrs);
+//         Ok(tokio::executor::DefaultExecutor::current().block_on(srch)?)
+//     }
+
+//     /// Perform a Search, but unlike [`search()`](#method.search) (q.v., also for
+//     /// the parameters), which returns all results at once, return a handle which
+//     /// will be used for retrieving entries one by one. See [`EntryStream`](struct.EntryStream.html)
+//     /// for the explanation of the protocol which must be adhered to in this case.
+//     pub fn streaming_search<S: AsRef<str>>(
+//         &self,
+//         base: &str,
+//         scope: Scope,
+//         filter: &str,
+//         attrs: Vec<S>,
+//     ) -> io::Result<EntryStream> {
+//         let mut strm = tokio_current_thread::block_on_all(
+//             self.inner
+//                 .clone()
+//                 .streaming_search(base, scope, filter, attrs),
+//         )?;
+//         let rx_r = strm.get_result_rx()?;
+//         Ok(EntryStream {
+//             // runtime: self.runtime.clone(),
+//             strm: Some(strm),
+//             rx_r: Some(rx_r),
+//         })
+//     }
+
+//     /// Add an entry named by `dn`, with the list of attributes and their values
+//     /// given in `attrs`. None of the `HashSet`s of values for an attribute may
+//     /// be empty.
+//     pub fn add<S: AsRef<[u8]> + Eq + Hash>(
+//         &self,
+//         dn: &str,
+//         attrs: Vec<(S, HashSet<S>)>,
+//     ) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().add(dn, attrs),
+//         )?)
+//     }
+
+//     /// Delete an entry named by `dn`.
+//     pub fn delete(&self, dn: &str) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().delete(dn),
+//         )?)
+//     }
+
+//     /// Modify an entry named by `dn` by sequentially applying the modifications given by `mods`.
+//     /// See the [`Mod`](enum.Mod.html) documentation for the description of possible values.
+//     pub fn modify<S: AsRef<[u8]> + Eq + Hash>(
+//         &self,
+//         dn: &str,
+//         mods: Vec<Mod<S>>,
+//     ) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().modify(dn, mods),
+//         )?)
+//     }
+
+//     /// Rename and/or move an entry named by `dn`. The new name is given by `rdn`. If
+//     /// `delete_old` is `true`, delete the previous value of the naming attribute from
+//     /// the entry. If the entry is to be moved elsewhere in the DIT, `new_sup` gives
+//     /// the new superior entry where the moved entry will be anchored.
+//     pub fn modifydn(
+//         &self,
+//         dn: &str,
+//         rdn: &str,
+//         delete_old: bool,
+//         new_sup: Option<&str>,
+//     ) -> io::Result<LdapResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().modifydn(dn, rdn, delete_old, new_sup),
+//         )?)
+//     }
+
+//     /// Terminate the connection to the server.
+//     pub fn unbind(&self) -> io::Result<()> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().unbind(),
+//         )?)
+//     }
+
+//     /// Compare the value(s) of the attribute `attr` within an entry named by `dn` with the
+//     /// value `val`. If any of the values is identical to the provided one, return result code 5
+//     /// (`compareTrue`), otherwise return result code 6 (`compareFalse`). If access control
+//     /// rules on the server disallow comparison, another result code will be used to indicate
+//     /// an error.
+//     pub fn compare<B: AsRef<[u8]>>(
+//         &self,
+//         dn: &str,
+//         attr: &str,
+//         val: B,
+//     ) -> io::Result<CompareResult> {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().compare(dn, attr, val),
+//         )?)
+//     }
+
+//     /// Perform an Extended operation given by `exop`. Extended operations are defined in the
+//     /// [`exop`](exop/index.html) module. See the module-level documentation for the list of extended
+//     /// operations supported by this library and procedures for defining custom exops.
+//     pub fn extended<E>(&self, exop: E) -> io::Result<ExopResult>
+//     where
+//         E: Into<Exop>,
+//     {
+//         Ok(tokio_current_thread::block_on_all(
+//             self.inner.clone().extended(exop),
+//         )?)
+//     }
+// }

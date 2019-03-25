@@ -3,6 +3,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(all(unix, not(feature = "minimal")))]
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, mem};
 
@@ -11,8 +12,7 @@ use futures::sync::mpsc;
 use futures::Future;
 #[cfg(feature = "tls")]
 use native_tls::TlsConnector;
-use tokio::prelude::FutureExt;
-use tokio::runtime::current_thread::Handle;
+// use tokio::prelude::FutureExt;
 use tokio_proto::multiplex::ClientService;
 use tokio_proto::TcpClient;
 use tokio_service::Service;
@@ -58,27 +58,27 @@ enum ClientMap {
 /// [`streaming_search()`](#method.streaming_search) method.
 pub struct Ldap {
     inner: ClientMap,
-    bundle: Rc<RefCell<ProtoBundle>>,
-    next_search_options: Rc<RefCell<Option<SearchOptions>>>,
-    next_req_controls: Rc<RefCell<Option<Vec<RawControl>>>>,
-    next_timeout: Rc<RefCell<Option<Duration>>>,
+    bundle: Arc<Mutex<ProtoBundle>>,
+    next_search_options: Arc<Mutex<Option<SearchOptions>>>,
+    next_req_controls: Arc<Mutex<Option<Vec<RawControl>>>>,
+    next_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
-pub fn bundle(ldap: &Ldap) -> Rc<RefCell<ProtoBundle>> {
+pub fn bundle(ldap: &Ldap) -> Arc<Mutex<ProtoBundle>> {
     ldap.bundle.clone()
 }
 
 pub fn next_search_options(ldap: &Ldap) -> Option<SearchOptions> {
-    ldap.next_search_options.borrow_mut().take()
+    ldap.next_search_options.clone().get_mut().unwrap().take()
 }
 
 pub fn next_req_controls(ldap: &Ldap) -> Option<Vec<RawControl>> {
-    ldap.next_search_options.borrow_mut().take();
-    ldap.next_req_controls.borrow_mut().take()
+    ldap.next_search_options.clone().get_mut().unwrap().take();
+    ldap.next_req_controls.clone().get_mut().unwrap().take()
 }
 
 pub fn next_timeout(ldap: &Ldap) -> Option<Duration> {
-    ldap.next_timeout.borrow_mut().take()
+    ldap.next_timeout.clone().get_mut().unwrap().take()
 }
 
 pub enum LdapOp {
@@ -96,18 +96,19 @@ pub struct LdapResponse(pub Tag, pub Vec<Control>);
 fn connect_with_timeout(
     timeout: Option<Duration>,
     fut: Box<Future<Item = Ldap, Error = io::Error>>,
-    handle: &Handle,
+    // handle: &Handle,
 ) -> Box<Future<Item = Ldap, Error = io::Error>> {
     if let Some(timeout) = timeout {
         let result = fut
-            .timeout(timeout)
+            // .timeout(timeout)
             .then(|res| match res {
                 Ok(resp) => future::ok(resp),
                 Err(e) => future::err(e),
             })
-            .map_err(|_e: tokio_timer::timeout::Error<_>| {
-                io::Error::new(io::ErrorKind::Other, "timeout")
-            });
+            // .map_err(|_e: tokio_timer::timeout::Error<_>| {
+            //     io::Error::new(io::ErrorKind::Other, "timeout")
+            // })
+            ;
         Box::new(result)
     } else {
         fut
@@ -120,7 +121,7 @@ impl Ldap {
     /// additional parameters, such as connection timeout.
     pub fn connect(
         addr: &SocketAddr,
-        handle: &Handle,
+        // handle: &Handle,
         settings: LdapConnSettings,
     ) -> Box<Future<Item = Ldap, Error = io::Error>> {
         let proto = LdapProto::new();
@@ -130,11 +131,14 @@ impl Ldap {
             .map(|client_proxy| Ldap {
                 inner: ClientMap::Plain(client_proxy),
                 bundle: bundle,
-                next_search_options: Rc::new(RefCell::new(None)),
-                next_req_controls: Rc::new(RefCell::new(None)),
-                next_timeout: Rc::new(RefCell::new(None)),
+                next_search_options: Arc::new(Mutex::new(None)),
+                next_req_controls: Arc::new(Mutex::new(None)),
+                next_timeout: Arc::new(Mutex::new(None)),
             });
-        connect_with_timeout(settings.conn_timeout, Box::new(ret), handle)
+        connect_with_timeout(
+            settings.conn_timeout,
+            Box::new(ret), //handle
+        )
     }
 
     /// Connect to an LDAP server using an IP address/port number in `addr` and an
@@ -151,7 +155,7 @@ impl Ldap {
     pub fn connect_ssl(
         addr: &SocketAddr,
         hostname: &str,
-        handle: &Handle,
+        // handle: &Handle, // TODO provide a runtime here
         settings: LdapConnSettings,
     ) -> Box<Future<Item = Ldap, Error = io::Error>> {
         let proto = LdapProto::new();
@@ -174,11 +178,14 @@ impl Ldap {
             .map(|client_proxy| Ldap {
                 inner: ClientMap::Tls(client_proxy),
                 bundle: bundle,
-                next_search_options: Rc::new(RefCell::new(None)),
-                next_req_controls: Rc::new(RefCell::new(None)),
-                next_timeout: Rc::new(RefCell::new(None)),
+                next_search_options: Arc::new(Mutex::new(None)),
+                next_req_controls: Arc::new(Mutex::new(None)),
+                next_timeout: Arc::new(Mutex::new(None)),
             });
-        connect_with_timeout(settings.conn_timeout, Box::new(ret), handle)
+        connect_with_timeout(
+            settings.conn_timeout,
+            Box::new(ret), // handle
+        )
     }
 
     /// Connect to an LDAP server through a Unix domain socket, using the path
@@ -198,9 +205,9 @@ impl Ldap {
             .map(|client_proxy| Ldap {
                 inner: ClientMap::Unix(client_proxy),
                 bundle: bundle,
-                next_search_options: Rc::new(RefCell::new(None)),
-                next_req_controls: Rc::new(RefCell::new(None)),
-                next_timeout: Rc::new(RefCell::new(None)),
+                next_search_options: Arc::new(Mutex::new(None)),
+                next_req_controls: Arc::new(Mutex::new(None)),
+                next_timeout: Arc::new(Mutex::new(None)),
             });
         Box::new(match client {
             Ok(ldap) => future::ok(ldap),
@@ -210,14 +217,17 @@ impl Ldap {
 
     /// See [`LdapConn::with_search_options()`](struct.LdapConn.html#method.with_search_options).
     pub fn with_search_options(&self, opts: SearchOptions) -> &Self {
-        mem::replace(&mut *self.next_search_options.borrow_mut(), Some(opts));
+        mem::replace(
+            &mut *self.next_search_options.clone().get_mut().unwrap(),
+            Some(opts),
+        );
         self
     }
 
     /// See [`LdapConn::with_controls()`](struct.LdapConn.html#method.with_controls).
     pub fn with_controls<V: IntoRawControlVec>(&self, ctrls: V) -> &Self {
         mem::replace(
-            &mut *self.next_req_controls.borrow_mut(),
+            &mut *self.next_req_controls.clone().get_mut().unwrap(),
             Some(ctrls.into()),
         );
         self
@@ -225,7 +235,10 @@ impl Ldap {
 
     /// See [`LdapConn::with_timeout()`](struct.LdapConn.html#method.with_timeout).
     pub fn with_timeout(&self, duration: Duration) -> &Self {
-        mem::replace(&mut *self.next_timeout.borrow_mut(), Some(duration));
+        mem::replace(
+            &mut *self.next_timeout.clone().get_mut().unwrap(),
+            Some(duration),
+        );
         self
     }
 }
@@ -234,7 +247,7 @@ impl Service for Ldap {
     type Request = LdapOp;
     type Response = LdapResponse;
     type Error = io::Error;
-    type Future = Box<Future<Item = Self::Response, Error = io::Error>>;
+    type Future = Box<Future<Item = Self::Response, Error = io::Error> + Send>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
         if let Some(timeout) = next_timeout(self) {
@@ -246,16 +259,18 @@ impl Service for Ldap {
                 LdapOp::Solo(_, _) => (false, true),
                 _ => (false, false),
             };
-            let assigned_msgid = Rc::new(RefCell::new(0));
+            let assigned_msgid = Arc::new(Mutex::new(0));
             let closure_assigned_msgid = assigned_msgid.clone();
             let bundle = self.bundle.clone();
             let result = self
                 .inner
                 .call((
                     req,
-                    Box::new(move |msgid| *closure_assigned_msgid.borrow_mut() = msgid),
+                    Box::new(move |msgid| {
+                        *closure_assigned_msgid.clone().get_mut().unwrap() = msgid
+                    }),
                 ))
-                .timeout(timeout)
+                // .timeout(timeout)
                 .map_err(|_e| io::Error::new(io::ErrorKind::Other, "timeout"))
                 .then(move |res| {
                     match res {
@@ -264,9 +279,11 @@ impl Service for Ldap {
                             if is_search {
                                 let tag = Tag::Enumerated(Enumerated {
                                     inner: *bundle
-                                        .borrow()
+                                        .clone()
+                                        .into_inner()
+                                        .unwrap()
                                         .id_map
-                                        .get(&*assigned_msgid.borrow())
+                                        .get(&*assigned_msgid.clone().get_mut().unwrap())
                                         .expect("id from id_map")
                                         as i64,
                                     ..Default::default()
@@ -277,9 +294,11 @@ impl Service for Ldap {
                                 // (unless the request was solo to begin with)
                                 if !is_solo {
                                     bundle
-                                        .borrow_mut()
+                                        .clone()
+                                        .get_mut()
+                                        .unwrap()
                                         .solo_ops
-                                        .push_back(*assigned_msgid.borrow());
+                                        .push_back(*assigned_msgid.clone().get_mut().unwrap());
                                 }
                                 future::err(io::Error::new(io::ErrorKind::Other, "timeout"))
                             }
