@@ -20,8 +20,8 @@ nom = "2.0"
 tokio-codec = "0.1"
 tokio = {version = "0.1", features = ["tcp"]}
 tokio-current-thread = "0.1"
-# tokio-proto = { git = "https://github.com/red75prime/tokio-proto" }
-tokio-proto = { path = "../tokio-proto" }
+tokio-proto = { git = "https://github.com/red75prime/tokio-proto" }
+# tokio-proto = { path = "../tokio-proto" }
 # tower = { git = "https://github.com/tower-rs/tower" }
 # tower-service = { git = "https://github.com/tower-rs/tower" }
 tokio-io = "0.1"
