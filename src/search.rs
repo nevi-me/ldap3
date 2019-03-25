@@ -7,21 +7,21 @@ use std::str;
 use std::time::Duration;
 use std::u64;
 
+use lber::common::TagClass::*;
 use lber::structure::StructureTag;
 use lber::structures::{Boolean, Enumerated, Integer, OctetString, Sequence, Tag};
-use lber::common::TagClass::*;
 
 use futures::future;
-use futures::{Async, Future, IntoFuture, Poll, Stream};
 use futures::sync::{mpsc, oneshot};
-use tokio_core::reactor::Timeout;
+use futures::{Async, Future, IntoFuture, Poll, Stream};
 use tokio_proto::multiplex::RequestId;
 use tokio_service::Service;
+use tokio_timer::{timer::Handle as TimerHandle, Timeout};
 
 use controls::types;
 use controls::{Control, PagedResults, RawControl};
 use filter::parse;
-use ldap::{bundle, next_search_options, next_req_controls, next_timeout};
+use ldap::{bundle, next_req_controls, next_search_options, next_timeout};
 use ldap::{Ldap, LdapOp, LdapResponse};
 use protocol::ProtoBundle;
 use result::{LdapResult, SearchResult};
@@ -30,24 +30,24 @@ use result::{LdapResult, SearchResult};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Scope {
     /// Base object; search only the object named in the base DN.
-    Base     = 0,
+    Base = 0,
     /// Search the objects immediately below the base DN.
     OneLevel = 1,
     /// Search the object named in the base DN and the whole subtree below it.
-    Subtree  = 2,
+    Subtree = 2,
 }
 
 /// Possible values for alias dereferencing during search.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DerefAliases {
     /// Never dereference.
-    Never     = 0,
+    Never = 0,
     /// Dereference while retrieving objects according to search scope.
     Searching = 1,
     /// Dereference while finding the base object.
-    Finding   = 2,
+    Finding = 2,
     /// Always dereference.
-    Always    = 3,
+    Always = 3,
 }
 
 pub enum SearchItem {
@@ -67,7 +67,7 @@ enum AbandonState {
 }
 
 /// Wrapper for the internal structure of a result entry.
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct ResultEntry(StructureTag);
 
 impl ResultEntry {
@@ -94,7 +94,7 @@ pub struct SearchStream {
     rx_r: Option<oneshot::Receiver<LdapResult>>,
     refs: Vec<HashSet<String>>,
     timeout: Option<Duration>,
-    entry_timeout: Option<Timeout>,
+    entry_timeout: Option<Timeout<TimerHandle>>,
     abandon_state: AbandonState,
     rx_a: Option<mpsc::UnboundedReceiver<()>>,
     autopage: Option<i32>,
@@ -125,7 +125,9 @@ impl SearchStream {
     /// search. It can be retrieved only once; it will return an error
     /// on second call.
     pub fn get_result_rx(&mut self) -> io::Result<oneshot::Receiver<LdapResult>> {
-        self.rx_r.take().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "channel already retrieved"))
+        self.rx_r
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "channel already retrieved"))
     }
 
     fn update_maps(&mut self, cause: EndCause) {
@@ -144,7 +146,7 @@ impl SearchStream {
 enum EndCause {
     Regular,
     InitialTimeout,
-    SubsequentTimeout,
+    // SubsequentTimeout,
     Abandoned,
 }
 
@@ -170,18 +172,22 @@ impl Stream for SearchStream {
                         AbandonState::AwaitingOp => return Ok(Async::NotReady),
                         _ => panic!("invalid abandon_state"),
                     },
-                    Err(_e) =>
-                        match self.abandon_state {
-                            AbandonState::AwaitingCmd => return Err(io::Error::new(io::ErrorKind::Other, "poll abandon channel")),
-                            AbandonState::AwaitingOp => (false, true),
-                            _ => panic!("invalid abandon_state"),
+                    Err(_e) => match self.abandon_state {
+                        AbandonState::AwaitingCmd => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "poll abandon channel",
+                            ))
                         }
+                        AbandonState::AwaitingOp => (false, true),
+                        _ => panic!("invalid abandon_state"),
+                    },
                 }
             } else {
                 (false, false)
             };
             if abandon_done {
-		if let Some(tx_r) = self.tx_r.take() {
+                if let Some(tx_r) = self.tx_r.take() {
                     let result = LdapResult {
                         rc: 88,
                         matched: "".to_owned(),
@@ -190,49 +196,57 @@ impl Stream for SearchStream {
                         ctrls: vec![],
                     };
                     self.update_maps(EndCause::Abandoned);
-                    tx_r.send(result).map_err(|_e| io::Error::new(io::ErrorKind::Other, "send result"))?;
+                    tx_r.send(result)
+                        .map_err(|_e| io::Error::new(io::ErrorKind::Other, "send result"))?;
                 }
-                return Ok(Async::Ready(None))
+                return Ok(Async::Ready(None));
             }
             if abandon_req {
                 let (tx_a, rx_a) = mpsc::unbounded::<()>();
                 self.abandon_state = AbandonState::AwaitingOp;
                 self.rx_a = Some(rx_a);
-                let handle = self.bundle.borrow().handle.clone();
                 let ldap = self.ldap.clone();
                 let msgid = match self.bundle.borrow().search_helpers.get(&self.id) {
                     Some(helper) => helper.msgid,
-                    None => return Err(io::Error::new(io::ErrorKind::Other, format!("helper not found for: {}", self.id))),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("helper not found for: {}", self.id),
+                        ))
+                    }
                 };
                 let abandon = if let Some(ref timeout) = self.timeout {
                     ldap.with_timeout(*timeout).abandon(msgid)
                 } else {
                     ldap.abandon(msgid)
                 };
-                handle.spawn(abandon.then(move |_r| {
-                    tx_a.unbounded_send(()).map_err(|_e| ())
-                }));
+                tokio::runtime::current_thread::spawn(
+                    abandon.then(move |_r| tx_a.unbounded_send(()).map_err(|_e| ())),
+                );
                 continue;
             }
             if let Some(ref timeout) = self.timeout {
                 if self.entry_timeout.is_none() {
-                    self.entry_timeout = Some(Timeout::new(*timeout, &self.bundle.borrow().handle)?);
+                    self.entry_timeout = Some(Timeout::new(TimerHandle::default(), *timeout));
                 }
             }
-            let timeout_fired = if let Some(ref mut timeout) = self.entry_timeout {
-                match timeout.poll() {
-                    Ok(Async::Ready(_)) => true,
-                    Ok(Async::NotReady) => false,
-                    Err(e) => return Err(e),
-                }
-            } else {
-                false
-            };
-            if timeout_fired {
-                self.update_maps(EndCause::SubsequentTimeout);
-                return Err(io::Error::new(io::ErrorKind::Other, "timeout"));
-            }
-            let item = try_ready!(self.rx_i.poll().map_err(|_e| io::Error::new(io::ErrorKind::Other, "poll search stream")));
+            // let timeout_fired = if let Some(timeout) = self.entry_timeout {
+            //     match timeout.poll() {
+            //         Ok(Async::Ready(_)) => true,
+            //         Ok(Async::NotReady) => false,
+            //         Err(e) => return Err(e),
+            //     }
+            // } else {
+            //     false
+            // };
+            // if timeout_fired {
+            //     self.update_maps(EndCause::SubsequentTimeout);
+            //     return Err(io::Error::new(io::ErrorKind::Other, "timeout"));
+            // }
+            let item = try_ready!(self
+                .rx_i
+                .poll()
+                .map_err(|_e| io::Error::new(io::ErrorKind::Other, "poll search stream")));
             match item {
                 Some(SearchItem::Done(_id, mut result, mut controls)) => {
                     if let Some(pagesize) = self.autopage {
@@ -248,31 +262,51 @@ impl Stream for SearchStream {
                                 if let Some(ref timeout) = self.timeout {
                                     self.ldap.with_timeout(*timeout);
                                 }
-                                let mut next_controls = if let Some(ref ctrls) = self.search_controls {
-                                    ctrls.clone()
-                                } else {
-                                    panic!("no saved controls for autopage");
-                                };
-                                next_controls.push(PagedResults { size: pagesize, cookie: pr.cookie.clone() }.into());
+                                let mut next_controls =
+                                    if let Some(ref ctrls) = self.search_controls {
+                                        ctrls.clone()
+                                    } else {
+                                        panic!("no saved controls for autopage");
+                                    };
+                                next_controls.push(
+                                    PagedResults {
+                                        size: pagesize,
+                                        cookie: pr.cookie.clone(),
+                                    }
+                                    .into(),
+                                );
                                 let next_req = if let Some(ref req) = self.search_op {
                                     req.clone()
                                 } else {
                                     panic!("no saved search op for autopage");
                                 };
                                 let cloned_tx = self.tx_i.clone();
-                                let next_search = self.ldap.call(LdapOp::Multi(next_req, self.tx_i.clone(), Some(next_controls))).then(move |res| {
-                                    let resp = match res {
-                                        Ok(res) => match res {
-                                            LdapResponse(Tag::Integer(Integer { inner, .. }), _) => SearchItem::NextId(inner as u64),
-                                            LdapResponse(Tag::Enumerated(Enumerated { inner, .. }), _) => SearchItem::Timeout(inner as u64),
-                                            _ => unimplemented!(),
-                                        },
-                                        Err(e) => SearchItem::Error(e),
-                                    };
-                                    cloned_tx.unbounded_send(resp).map_err(|_e| ())
-                                });
-                                let handle = self.bundle.borrow().handle.clone();
-                                handle.spawn(next_search);
+                                let next_search = self
+                                    .ldap
+                                    .call(LdapOp::Multi(
+                                        next_req,
+                                        self.tx_i.clone(),
+                                        Some(next_controls),
+                                    ))
+                                    .then(move |res| {
+                                        let resp = match res {
+                                            Ok(res) => match res {
+                                                LdapResponse(
+                                                    Tag::Integer(Integer { inner, .. }),
+                                                    _,
+                                                ) => SearchItem::NextId(inner as u64),
+                                                LdapResponse(
+                                                    Tag::Enumerated(Enumerated { inner, .. }),
+                                                    _,
+                                                ) => SearchItem::Timeout(inner as u64),
+                                                _ => unimplemented!(),
+                                            },
+                                            Err(e) => SearchItem::Error(e),
+                                        };
+                                        cloned_tx.unbounded_send(resp).map_err(|_e| ())
+                                    });
+                                // let handle = self.bundle.borrow().runtime.;
+                                tokio::runtime::current_thread::spawn(next_search);
                                 continue 'poll_loop;
                             }
                         }
@@ -284,34 +318,39 @@ impl Stream for SearchStream {
                     self.update_maps(EndCause::Regular);
                     result.ctrls = controls;
                     let tx_r = self.tx_r.take().expect("oneshot tx");
-                    tx_r.send(result).map_err(|_e| io::Error::new(io::ErrorKind::Other, "send result"))?;
+                    tx_r.send(result)
+                        .map_err(|_e| io::Error::new(io::ErrorKind::Other, "send result"))?;
                     return Ok(Async::Ready(None));
-                },
+                }
                 Some(SearchItem::NextId(id)) => {
                     self.id = id;
                     continue;
-                },
+                }
                 Some(SearchItem::Timeout(id)) => {
                     self.id = id;
                     self.update_maps(EndCause::InitialTimeout);
                     return Err(io::Error::new(io::ErrorKind::Other, "timeout"));
-                },
+                }
                 Some(SearchItem::Error(e)) => {
                     return Err(e);
-                },
+                }
                 Some(SearchItem::Entry(tag)) => {
                     self.entry_timeout.take();
-                    return Ok(Async::Ready(Some(ResultEntry(tag))))
-                },
+                    return Ok(Async::Ready(Some(ResultEntry(tag))));
+                }
                 Some(SearchItem::Referral(tag)) => {
-                    self.refs.push(tag.expect_constructed().expect("referrals").into_iter()
-                        .map(|t| t.expect_primitive().expect("octet string"))
-                        .map(String::from_utf8)
-                        .map(|s| s.expect("uri"))
-                        .collect());
+                    self.refs.push(
+                        tag.expect_constructed()
+                            .expect("referrals")
+                            .into_iter()
+                            .map(|t| t.expect_primitive().expect("octet string"))
+                            .map(String::from_utf8)
+                            .map(|s| s.expect("uri"))
+                            .collect(),
+                    );
                     self.entry_timeout.take();
                     continue;
-                },
+                }
                 None => return Ok(Async::Ready(None)),
             }
         }
@@ -336,7 +375,7 @@ impl Stream for SearchStream {
 /// de-emphasized in favor of custom Serde deserialization of search results directly
 /// into a user-supplied struct, which is expected to be a better fit for the
 /// majority of uses.
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct SearchEntry {
     /// Entry DN.
     pub dn: String,
@@ -352,31 +391,65 @@ impl SearchEntry {
     /// __Note__: this function will panic on parsing error. Error handling will be
     /// improved in a future version of the library.
     pub fn construct(re: ResultEntry) -> SearchEntry {
-        let mut tags = re.0.match_id(4).and_then(|t| t.expect_constructed()).expect("entry").into_iter();
-        let dn = String::from_utf8(tags.next().expect("element").expect_primitive().expect("octet string"))
-            .expect("dn");
+        let mut tags =
+            re.0.match_id(4)
+                .and_then(|t| t.expect_constructed())
+                .expect("entry")
+                .into_iter();
+        let dn = String::from_utf8(
+            tags.next()
+                .expect("element")
+                .expect_primitive()
+                .expect("octet string"),
+        )
+        .expect("dn");
         let mut attr_vals = HashMap::new();
         let mut bin_attr_vals = HashMap::new();
-        let attrs = tags.next().expect("element").expect_constructed().expect("attrs").into_iter();
+        let attrs = tags
+            .next()
+            .expect("element")
+            .expect_constructed()
+            .expect("attrs")
+            .into_iter();
         for a_v in attrs {
-            let mut part_attr = a_v.expect_constructed().expect("partial attribute").into_iter();
-            let a_type = String::from_utf8(part_attr.next().expect("element").expect_primitive().expect("octet string"))
-                .expect("attribute type");
+            let mut part_attr = a_v
+                .expect_constructed()
+                .expect("partial attribute")
+                .into_iter();
+            let a_type = String::from_utf8(
+                part_attr
+                    .next()
+                    .expect("element")
+                    .expect_primitive()
+                    .expect("octet string"),
+            )
+            .expect("attribute type");
             let mut any_binary = false;
-            let values = part_attr.next().expect("element").expect_constructed().expect("values").into_iter()
+            let values = part_attr
+                .next()
+                .expect("element")
+                .expect_constructed()
+                .expect("values")
+                .into_iter()
                 .map(|t| t.expect_primitive().expect("octet string"))
                 .filter_map(|s| {
                     if let Ok(s) = str::from_utf8(s.as_ref()) {
                         return Some(s.to_owned());
                     }
-                    bin_attr_vals.entry(a_type.clone()).or_insert_with(|| vec![]).push(s);
+                    bin_attr_vals
+                        .entry(a_type.clone())
+                        .or_insert_with(|| vec![])
+                        .push(s);
                     any_binary = true;
                     None
                 })
                 .collect::<Vec<String>>();
             if any_binary {
                 bin_attr_vals.get_mut(&a_type).expect("bin vector").extend(
-                    values.into_iter().map(String::into_bytes).collect::<Vec<Vec<u8>>>()
+                    values
+                        .into_iter()
+                        .map(String::into_bytes)
+                        .collect::<Vec<Vec<u8>>>(),
                 );
             } else {
                 attr_vals.insert(a_type, values);
@@ -403,7 +476,7 @@ pub struct SearchOptions {
 impl SearchOptions {
     /// Create an instance of the structure with default values.
     // Constructing SearchOptions through Default::default() seems very unlikely
-    #[cfg_attr(feature="cargo-clippy", allow(new_without_default))]
+    // #[cfg_attr(feature = "cargo-clippy")]
     pub fn new() -> Self {
         SearchOptions {
             deref: DerefAliases::Never,
@@ -462,20 +535,24 @@ impl SearchOptions {
 
 impl Ldap {
     /// See [`LdapConn::search()`](struct.LdapConn.html#method.search).
-    pub fn search<S: AsRef<str>>(&self, base: &str, scope: Scope, filter: &str, attrs: Vec<S>) ->
-        Box<Future<Item=SearchResult, Error=io::Error>>
-    {
+    pub fn search<S: AsRef<str>>(
+        &self,
+        base: &str,
+        scope: Scope,
+        filter: &str,
+        attrs: Vec<S>,
+    ) -> Box<Future<Item = SearchResult, Error = io::Error>> {
         let srch = self
             .streaming_search(base, scope, filter, attrs)
-            .and_then(|mut strm| strm
-                .get_result_rx()
-                .into_future()
-                .and_then(|rx_r| rx_r
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-                    .join(strm.collect())
-                )
-                .map(|(result, result_set)| SearchResult(result_set, result))
-            );
+            .and_then(|mut strm| {
+                strm.get_result_rx()
+                    .into_future()
+                    .and_then(|rx_r| {
+                        rx_r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                            .join(strm.collect())
+                    })
+                    .map(|(result, result_set)| SearchResult(result_set, result))
+            });
         Box::new(srch)
     }
 
@@ -487,9 +564,13 @@ impl Ldap {
     /// is drained, should be retrieved from the stream instance with
     /// [`get_result_rx()`](struct.SearchStream.html#method.get_result_rx). The stream and
     /// the receiver should be polled concurrently with `Future::join()`.
-    pub fn streaming_search<S: AsRef<str>>(&self, base: &str, scope: Scope, filter: &str, attrs: Vec<S>) ->
-        Box<Future<Item=SearchStream, Error=io::Error>>
-    {
+    pub fn streaming_search<S: AsRef<str>>(
+        &self,
+        base: &str,
+        scope: Scope,
+        filter: &str,
+        attrs: Vec<S>,
+    ) -> Box<Future<Item = SearchStream, Error = io::Error>> {
         let opts = match next_search_options(self) {
             Some(opts) => opts,
             None => SearchOptions::new(),
@@ -498,39 +579,51 @@ impl Ldap {
             id: 3,
             class: Application,
             inner: vec![
-                   Tag::OctetString(OctetString {
-                       inner: Vec::from(base.as_bytes()),
-                       .. Default::default()
-                   }),
-                   Tag::Enumerated(Enumerated {
-                       inner: scope as i64,
-                       .. Default::default()
-                   }),
-                   Tag::Enumerated(Enumerated {
-                       inner: opts.deref as i64,
-                       .. Default::default()
-                   }),
-                   Tag::Integer(Integer {
-                       inner: opts.sizelimit as i64,
-                       .. Default::default()
-                   }),
-                   Tag::Integer(Integer {
-                       inner: opts.timelimit as i64,
-                       .. Default::default()
-                   }),
-                   Tag::Boolean(Boolean {
-                       inner: opts.typesonly,
-                       .. Default::default()
-                   }),
-                   match parse(filter) {
-                       Ok(filter) => filter,
-                       _ => return Box::new(future::err(io::Error::new(io::ErrorKind::Other, "filter parse error"))),
-                   },
-                   Tag::Sequence(Sequence {
-                       inner: attrs.into_iter().map(|s|
-                            Tag::OctetString(OctetString { inner: Vec::from(s.as_ref()), ..Default::default() })).collect(),
-                       .. Default::default()
-                   })
+                Tag::OctetString(OctetString {
+                    inner: Vec::from(base.as_bytes()),
+                    ..Default::default()
+                }),
+                Tag::Enumerated(Enumerated {
+                    inner: scope as i64,
+                    ..Default::default()
+                }),
+                Tag::Enumerated(Enumerated {
+                    inner: opts.deref as i64,
+                    ..Default::default()
+                }),
+                Tag::Integer(Integer {
+                    inner: opts.sizelimit as i64,
+                    ..Default::default()
+                }),
+                Tag::Integer(Integer {
+                    inner: opts.timelimit as i64,
+                    ..Default::default()
+                }),
+                Tag::Boolean(Boolean {
+                    inner: opts.typesonly,
+                    ..Default::default()
+                }),
+                match parse(filter) {
+                    Ok(filter) => filter,
+                    _ => {
+                        return Box::new(future::err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "filter parse error",
+                        )))
+                    }
+                },
+                Tag::Sequence(Sequence {
+                    inner: attrs
+                        .into_iter()
+                        .map(|s| {
+                            Tag::OctetString(OctetString {
+                                inner: Vec::from(s.as_ref()),
+                                ..Default::default()
+                            })
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
             ],
         });
 
@@ -544,45 +637,63 @@ impl Ldap {
         let ldap = self.clone();
         let (saved_op, saved_controls) = if let Some(pagesize) = opts.autopage {
             let mut controls = if let Some(controls) = next_req_controls(self) {
-                if controls.iter().filter(|&control| &control.ctype == "1.2.840.113556.1.4.319").count() > 0 {
-                    return Box::new(future::err(io::Error::new(io::ErrorKind::Other, "PagedResults control present together with autopage")));
+                if controls
+                    .iter()
+                    .filter(|&control| &control.ctype == "1.2.840.113556.1.4.319")
+                    .count()
+                    > 0
+                {
+                    return Box::new(future::err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "PagedResults control present together with autopage",
+                    )));
                 }
                 controls
             } else {
                 vec![]
             };
             let saved_controls = controls.clone();
-            controls.push(PagedResults { size: pagesize, cookie: Vec::new() }.into());
+            controls.push(
+                PagedResults {
+                    size: pagesize,
+                    cookie: Vec::new(),
+                }
+                .into(),
+            );
             self.with_controls(controls);
             (Some(req.clone()), Some(saved_controls))
         } else {
             (None, None)
         };
-        let fut = self.call(LdapOp::Multi(req, tx_i.clone(), next_req_controls(self))).and_then(move |res| {
-            let (id, initial_timeout) = match res {
-                LdapResponse(Tag::Integer(Integer { inner, .. }), _) => (inner as u64, false),
-                LdapResponse(Tag::Enumerated(Enumerated { inner, .. }), _) => (inner as u64, true),
-                _ => unimplemented!(),
-            };
-            Ok(SearchStream {
-                id: id,
-                initial_timeout: initial_timeout,
-                ldap: ldap,
-                bundle: bundle,
-                tx_i: tx_i,
-                rx_i: rx_i,
-                tx_r: Some(tx_r),
-                rx_r: Some(rx_r),
-                refs: Vec::new(),
-                timeout: timeout,
-                entry_timeout: None,
-                abandon_state: AbandonState::Idle,
-                rx_a: None,
-                autopage: opts.autopage,
-                search_op: saved_op,
-                search_controls: saved_controls,
-            })
-        });
+        let fut = self
+            .call(LdapOp::Multi(req, tx_i.clone(), next_req_controls(self)))
+            .and_then(move |res| {
+                let (id, initial_timeout) = match res {
+                    LdapResponse(Tag::Integer(Integer { inner, .. }), _) => (inner as u64, false),
+                    LdapResponse(Tag::Enumerated(Enumerated { inner, .. }), _) => {
+                        (inner as u64, true)
+                    }
+                    _ => unimplemented!(),
+                };
+                Ok(SearchStream {
+                    id: id,
+                    initial_timeout: initial_timeout,
+                    ldap: ldap,
+                    bundle: bundle,
+                    tx_i: tx_i,
+                    rx_i: rx_i,
+                    tx_r: Some(tx_r),
+                    rx_r: Some(rx_r),
+                    refs: Vec::new(),
+                    timeout: timeout,
+                    entry_timeout: None,
+                    abandon_state: AbandonState::Idle,
+                    rx_a: None,
+                    autopage: opts.autopage,
+                    search_op: saved_op,
+                    search_controls: saved_controls,
+                })
+            });
 
         Box::new(fut)
     }

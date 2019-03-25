@@ -7,22 +7,22 @@ use std::{i32, u64};
 use bytes::BytesMut;
 use futures::sync::mpsc;
 use futures::{self, Async, Poll, StartSend, Stream};
-use tokio_core::reactor::Handle;
+use tokio::runtime::current_thread::Handle;
 use tokio_codec::{Decoder, Encoder, Framed};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_proto::multiplex::{ClientProto, RequestId};
 
 use lber::common::TagClass;
-use lber::{Consumer, ConsumerState, Input, IResult, Move};
-use lber::structure::{PL, StructureTag};
-use lber::structures::{ASNTag, Integer, Null, Sequence, Tag};
 use lber::parse::parse_uint;
 use lber::parse::Parser;
+use lber::structure::{StructureTag, PL};
+use lber::structures::{ASNTag, Integer, Null, Sequence, Tag};
 use lber::universal::Types;
 use lber::write;
+use lber::{Consumer, ConsumerState, IResult, Input, Move};
 
 use controls::Control;
-use controls_impl::{parse_controls, build_tag};
+use controls_impl::{build_tag, parse_controls};
 use exop::Exop;
 use ldap::LdapOp;
 use result::LdapResult;
@@ -34,17 +34,20 @@ pub struct ProtoBundle {
     pub search_helpers: HashMap<RequestId, SearchHelper>,
     pub id_map: HashMap<LdapRequestId, RequestId>,
     pub next_id: LdapRequestId,
-    pub handle: Handle,
+    // pub handle: Handle,
     pub solo_ops: VecDeque<LdapRequestId>,
 }
 
 impl ProtoBundle {
     fn create_search_helper(&mut self, id: RequestId, tx: mpsc::UnboundedSender<SearchItem>) {
-        self.search_helpers.insert(id, SearchHelper {
-            seen: false,
-            msgid: 0,           // not valid, must be properly initialized later
-            tx: tx,
-        });
+        self.search_helpers.insert(
+            id,
+            SearchHelper {
+                seen: false,
+                msgid: 0, // not valid, must be properly initialized later
+                tx: tx,
+            },
+        );
     }
 
     fn inc_next_id(&mut self) -> LdapRequestId {
@@ -64,7 +67,9 @@ pub struct SearchHelper {
 
 impl SearchHelper {
     fn send_item(&mut self, item: SearchItem) -> io::Result<()> {
-        self.tx.unbounded_send(item).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.tx
+            .unbounded_send(item)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
 
@@ -78,18 +83,32 @@ impl From<Tag> for LdapResultExt {
             _ => unimplemented!(),
         };
         let mut tags = t.expect_constructed().expect("result sequence").into_iter();
-        let rc = match parse_uint(tags.next().expect("element")
+        let rc = match parse_uint(
+            tags.next()
+                .expect("element")
                 .match_class(TagClass::Universal)
                 .and_then(|t| t.match_id(Types::Enumerated as u64))
-                .and_then(|t| t.expect_primitive()).expect("result code")
-                .as_slice()) {
+                .and_then(|t| t.expect_primitive())
+                .expect("result code")
+                .as_slice(),
+        ) {
             IResult::Done(_, rc) => rc as u32,
             _ => panic!("failed to parse result code"),
         };
-        let matched = String::from_utf8(tags.next().expect("element").expect_primitive().expect("octet string"))
-            .expect("matched dn");
-        let text = String::from_utf8(tags.next().expect("element").expect_primitive().expect("octet string"))
-            .expect("diagnostic message");
+        let matched = String::from_utf8(
+            tags.next()
+                .expect("element")
+                .expect_primitive()
+                .expect("octet string"),
+        )
+        .expect("matched dn");
+        let text = String::from_utf8(
+            tags.next()
+                .expect("element")
+                .expect_primitive()
+                .expect("octet string"),
+        )
+        .expect("diagnostic message");
         let mut refs = Vec::new();
         let mut exop_name = None;
         let mut exop_val = None;
@@ -102,14 +121,20 @@ impl From<Tag> for LdapResultExt {
                             Some(rr) => rr,
                             None => panic!("failed to parse referrals"),
                         };
-                        refs.push(raw_refs.into_iter()
-                            .map(|t| t.expect_primitive().expect("octet string"))
-                            .map(String::from_utf8)
-                            .map(|s| s.expect("uri"))
-                            .collect());
-                    },
+                        refs.push(
+                            raw_refs
+                                .into_iter()
+                                .map(|t| t.expect_primitive().expect("octet string"))
+                                .map(String::from_utf8)
+                                .map(|s| s.expect("uri"))
+                                .collect(),
+                        );
+                    }
                     10 => {
-                        exop_name = Some(String::from_utf8(comp.expect_primitive().expect("octet string")).expect("exop name"));
+                        exop_name = Some(
+                            String::from_utf8(comp.expect_primitive().expect("octet string"))
+                                .expect("exop name"),
+                        );
                     }
                     11 => {
                         exop_val = Some(comp.expect_primitive().expect("octet string"));
@@ -128,8 +153,9 @@ impl From<Tag> for LdapResultExt {
             },
             Exop {
                 name: exop_name,
-                val: exop_val
-            })
+                val: exop_val,
+            },
+        )
     }
 }
 
@@ -156,13 +182,20 @@ impl Decoder for LdapCodec {
         };
         buf.split_to(amt);
         let tag = tag.clone();
-        let mut tags = match tag.match_id(Types::Sequence as u64).and_then(|t| t.expect_constructed()) {
+        let mut tags = match tag
+            .match_id(Types::Sequence as u64)
+            .and_then(|t| t.expect_constructed())
+        {
             Some(tags) => tags,
             None => return Err(decoding_error),
         };
         let maybe_controls = tags.pop().expect("element");
         let has_controls = match maybe_controls {
-            StructureTag { id, class, ref payload } if class == TagClass::Context && id == 0 => match *payload {
+            StructureTag {
+                id,
+                class,
+                ref payload,
+            } if class == TagClass::Context && id == 0 => match *payload {
                 PL::C(_) => true,
                 PL::P(_) => return Err(decoding_error),
             },
@@ -177,11 +210,15 @@ impl Decoder for LdapCodec {
             Some(controls) => parse_controls(controls),
             None => vec![],
         };
-        let msgid = match parse_uint(tags.pop().expect("element")
+        let msgid = match parse_uint(
+            tags.pop()
+                .expect("element")
                 .match_class(TagClass::Universal)
                 .and_then(|t| t.match_id(Types::Integer as u64))
-                .and_then(|t| t.expect_primitive()).expect("message id")
-                .as_slice()) {
+                .and_then(|t| t.expect_primitive())
+                .expect("message id")
+                .as_slice(),
+        ) {
             IResult::Done(_, id) => id as i32,
             _ => return Err(decoding_error),
         };
@@ -189,21 +226,30 @@ impl Decoder for LdapCodec {
             Some(&id) => id,
             None => {
                 warn!("discarding frame with unmatched msgid: {}", msgid);
-                let null_tag = Tag::Null(Null { ..Default::default() });
+                let null_tag = Tag::Null(Null {
+                    ..Default::default()
+                });
                 return Ok(Some((u64::MAX, (null_tag, vec![]))));
-            },
+            }
         };
         match protoop.id {
             op_id @ 4 | op_id @ 5 | op_id @ 19 => {
-                let null_tag = Tag::Null(Null { ..Default::default() });
+                let null_tag = Tag::Null(Null {
+                    ..Default::default()
+                });
                 let id_tag = Tag::Integer(Integer {
                     inner: id as i64,
-                    .. Default::default()
+                    ..Default::default()
                 });
                 let mut bundle = self.bundle.borrow_mut();
                 let helper = match bundle.search_helpers.get_mut(&id) {
                     Some(h) => h,
-                    None => return Err(io::Error::new(io::ErrorKind::Other, format!("id mismatch: {}", id))),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("id mismatch: {}", id),
+                        ))
+                    }
                 };
                 helper.send_item(match op_id {
                     4 => SearchItem::Entry(protoop),
@@ -217,11 +263,11 @@ impl Decoder for LdapCodec {
                     helper.seen = true;
                     Ok(Some((id, (id_tag, vec![]))))
                 }
-            },
+            }
             _ => {
                 self.bundle.borrow_mut().id_map.remove(&msgid);
                 Ok(Some((id, (Tag::StructureTag(protoop), controls))))
-            },
+            }
         }
     }
 }
@@ -238,7 +284,7 @@ impl Encoder for LdapCodec {
             LdapOp::Multi(tag, tx, controls) => {
                 self.bundle.borrow_mut().create_search_helper(id, tx);
                 (tag, controls, false)
-            },
+            }
         };
         let outstruct = {
             // tokio-proto ids are u64, and LDAP (client) message ids are i32 > 0,
@@ -249,7 +295,10 @@ impl Encoder for LdapCodec {
             let mut next_ldap_id = prev_ldap_id;
             while bundle.id_map.entry(next_ldap_id).or_insert(id) != &id {
                 next_ldap_id = bundle.inc_next_id();
-                assert_ne!(next_ldap_id, prev_ldap_id, "LDAP message id wraparound with no free slots");
+                assert_ne!(
+                    next_ldap_id, prev_ldap_id,
+                    "LDAP message id wraparound with no free slots"
+                );
             }
             bundle.inc_next_id();
             set_msgid_in_op(next_ldap_id);
@@ -262,21 +311,22 @@ impl Encoder for LdapCodec {
             let mut msg = vec![
                 Tag::Integer(Integer {
                     inner: next_ldap_id as i64,
-                    .. Default::default()
+                    ..Default::default()
                 }),
-                tag
+                tag,
             ];
             if let Some(controls) = controls {
                 msg.push(Tag::StructureTag(StructureTag {
                     id: 0,
                     class: TagClass::Context,
-                    payload: PL::C(controls.into_iter().map(build_tag).collect())
+                    payload: PL::C(controls.into_iter().map(build_tag).collect()),
                 }));
             }
             Tag::Sequence(Sequence {
                 inner: msg,
-                .. Default::default()
-            }).into_structure()
+                ..Default::default()
+            })
+            .into_structure()
         };
         trace!("Sending packet: {:?}", &outstruct);
         write::encode_into(into, outstruct)?;
@@ -290,15 +340,14 @@ pub struct LdapProto {
 }
 
 impl LdapProto {
-    pub fn new(handle: Handle) -> LdapProto {
+    pub fn new() -> LdapProto {
         LdapProto {
             bundle: Rc::new(RefCell::new(ProtoBundle {
                 search_helpers: HashMap::new(),
                 id_map: HashMap::new(),
                 next_id: 1,
-                handle: handle,
                 solo_ops: VecDeque::new(),
-            }))
+            })),
         }
     }
 
@@ -313,7 +362,8 @@ pub struct ResponseFilter<T> {
 }
 
 impl<T> Stream for ResponseFilter<T>
-    where T: Stream<Item=(RequestId, (Tag, Vec<Control>)), Error=io::Error>
+where
+    T: Stream<Item = (RequestId, (Tag, Vec<Control>)), Error = io::Error>,
 {
     type Item = (RequestId, (Tag, Vec<Control>));
     type Error = io::Error;
@@ -322,8 +372,15 @@ impl<T> Stream for ResponseFilter<T>
         loop {
             let maybe_msgid = self.bundle.borrow_mut().solo_ops.pop_front();
             if let Some(msgid) = maybe_msgid {
-                let id = self.bundle.borrow_mut().id_map.remove(&msgid).expect("id from id_map");
-                let null_tag = Tag::Null(Null { ..Default::default() });
+                let id = self
+                    .bundle
+                    .borrow_mut()
+                    .id_map
+                    .remove(&msgid)
+                    .expect("id from id_map");
+                let null_tag = Tag::Null(Null {
+                    ..Default::default()
+                });
                 return Ok(Async::Ready(Some((id, (null_tag, vec![])))));
             }
             match try_ready!(self.upstream.poll()) {
@@ -335,7 +392,8 @@ impl<T> Stream for ResponseFilter<T>
 }
 
 impl<T> futures::Sink for ResponseFilter<T>
-    where T: futures::Sink<SinkItem=(RequestId, (LdapOp, Box<Fn(i32)>)), SinkError=io::Error>
+where
+    T: futures::Sink<SinkItem = (RequestId, (LdapOp, Box<Fn(i32)>)), SinkError = io::Error>,
 {
     type SinkItem = (RequestId, (LdapOp, Box<Fn(i32)>));
     type SinkError = io::Error;

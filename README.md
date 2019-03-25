@@ -82,7 +82,7 @@ use std::error::Error;
 
 use futures::Future;
 use ldap3::{LdapConnAsync, Scope, SearchEntry};
-use tokio_core::reactor::Core;
+// use tokio_core::reactor::Core;
 
 fn main() {
     match do_search() {

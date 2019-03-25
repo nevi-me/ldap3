@@ -10,18 +10,20 @@ repository = "https://github.com/inejge/ldap3"
 version = "0.6.1"
 
 [dependencies]
-byteorder = "1.0.0"
-bytes = "0.4.1"
-futures = "0.1.15"
+byteorder = "1"
+bytes = "0.4"
+futures = "0.1"
 lazy_static = "1.1"
 log = "0.4"
 native-tls = { version = "0.2", optional = true }
 nom = "2.0"
 tokio-codec = "0.1"
-tokio-core = "0.1"
-tokio-io = "0.1.1"
-tokio-proto = "0.1"
+tokio = {version = "0.1", features = ["tcp"]}
+tokio-proto = { git = "https://github.com/red75prime/tokio-proto" }
+tokio-io = "0.1"
+tokio-tcp = "0.1"
 tokio-service = "0.1"
+tokio-timer = "0.2"
 url = "1.4.0"
 
 [target.'cfg(all(unix, not(feature = "minimal")))'.dependencies]
